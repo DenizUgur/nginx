@@ -20,6 +20,7 @@ typedef struct {
     off_t                end;
     ngx_str_t            range;
     ngx_str_t            etag;
+    time_t               last_modified;
     unsigned             last:1;
     unsigned             active:1;
     ngx_http_request_t  *sr;
@@ -143,6 +144,27 @@ ngx_http_slice_header_filter(ngx_http_request_t *r)
         ctx->etag = h->value;
     }
 
+    if (!ctx->etag.len) {
+        if (ctx->last_modified) {
+            if (!r->headers_out.last_modified_time) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                            "last modified header missing in slice response headers");
+                return NGX_ERROR;
+            }
+
+            if (r->headers_out.last_modified_time != ctx->last_modified) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                            "last modified mismatch in slice response header: %T vs %T",
+                            r->headers_out.last_modified_time, ctx->last_modified);
+                return NGX_ERROR;
+            }
+        }
+
+        if (!ctx->last_modified) {
+            ctx->last_modified = r->headers_out.last_modified_time;
+        }
+    }
+
     if (ngx_http_slice_parse_content_range(r, &cr) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "invalid range in slice response");
@@ -187,7 +209,6 @@ ngx_http_slice_header_filter(ngx_http_request_t *r)
 
     r->allow_ranges = 1;
     r->subrequest_ranges = 1;
-    r->single_range = 1;
 
     rc = ngx_http_next_header_filter(r);
 
@@ -205,6 +226,14 @@ ngx_http_slice_header_filter(ngx_http_request_t *r)
 
         ctx->end = r->headers_out.content_offset
                    + r->headers_out.content_length_n;
+        if (r->ranges) {
+            ctx->end = cr.complete_length;
+        }
+        /*
+         * otherwise you reach ngx_http_send_special()
+         * from slice body filter too early
+         * and close the request with the body not fully sent
+         */
 
     } else {
         ctx->end = cr.complete_length;
@@ -226,6 +255,20 @@ ngx_http_slice_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     if (ctx == NULL || r != r->main) {
         return ngx_http_next_body_filter(r, in);
+    }
+
+    slcf = ngx_http_get_module_loc_conf(r, ngx_http_slice_filter_module);
+
+    if (r->cache && !r->cache->slice_size) {
+        r->cache->slice_size = slcf->size;
+    }
+
+    if (r->cache && ctx->last_modified
+        && r->cache->last_modified != ctx->last_modified) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "last modified mismatch in cache and slice response header: %T vs %T",
+                      r->cache->last_modified, ctx->last_modified);
+        return NGX_ERROR;
     }
 
     for (cl = in; cl; cl = cl->next) {
@@ -253,6 +296,40 @@ ngx_http_slice_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         return NGX_ERROR;
     }
 
+    if (r->ranges) {
+        ngx_http_range_t *range;
+        range = r->ranges->elts;
+
+        if (range[r->ranges->nelts - 1].boundary_appended) {
+            ngx_http_set_ctx(r, NULL, ngx_http_slice_filter_module);
+            ngx_http_send_special(r, NGX_HTTP_LAST);
+            return rc;
+        }
+
+        /*
+         * ctx->start determines what slice will be opened in the
+         * posted subrequest. Set ctx->start = to the start of
+         * the slice containing the beginning of the lowest
+         * unfulfilled range, or start+fulfilled
+         * to move onto the next slice
+         */
+        for (ngx_uint_t i = 0; i < r->ranges->nelts; i++) {
+            off_t start = 0;
+            off_t bytes_lacking = ((range[i].end - range[i].start) - range[i].fulfilled);
+
+            if (bytes_lacking == 0) continue;
+            if (range[i].fulfilled == 0) start = range[i].start;
+            if (range[i].fulfilled) start = range[i].start + range[i].fulfilled;
+
+            ctx->start = slcf->size * (start / slcf->size);
+
+            ngx_log_debug5(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "multirange[%ui] start:%O end:%O fulfilled:%O | slice next start:%O",
+               i, range[i].start, range[i].end, range[i].fulfilled, ctx->start);
+            break;
+        }
+    }
+
     if (ctx->start >= ctx->end) {
         ngx_http_set_ctx(r, NULL, ngx_http_slice_filter_module);
         ngx_http_send_special(r, NGX_HTTP_LAST);
@@ -271,8 +348,6 @@ ngx_http_slice_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     ngx_http_set_ctx(ctx->sr, ctx, ngx_http_slice_filter_module);
-
-    slcf = ngx_http_get_module_loc_conf(r, ngx_http_slice_filter_module);
 
     ctx->range.len = ngx_sprintf(ctx->range.data, "bytes=%O-%O", ctx->start,
                                  ctx->start + (off_t) slcf->size - 1)
@@ -465,6 +540,20 @@ ngx_http_slice_get_start(ngx_http_request_t *r)
     }
 
     p = h->value.data + 6;
+
+    /*
+     * multirange
+     * It's easy in principle to make this function return the start of the
+     * slice needed for the first range.  The problem is that if the sum
+     * of ranges is greater than the file, and the response is going
+     * to be 200, not 206, then the range module won't be called at all, and
+     * slice body filter will assume it is iterating  over slices starting at 0.
+     *
+     * Another limitation is observed with open ranges like '-5'
+     * -5 = last 5 bytes but it returns 0 so first slice is opened and skipped.
+     * This thing is called too early to know anything about the size of the
+     * full file. It's building the proxy_cache_key.
+     */
 
     if (ngx_strchr(p, ',')) {
         return 0;

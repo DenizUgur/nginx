@@ -77,6 +77,22 @@ typedef struct {
 } ngx_http_status_t;
 
 
+typedef struct {
+    off_t        start;
+    off_t        end;
+    ngx_str_t    content_range;
+    off_t        fulfilled;
+    unsigned     boundary_prepended:1;
+    unsigned     boundary_appended:1;
+} ngx_http_range_t;
+
+
+typedef struct {
+    off_t        start;
+    off_t        end;
+} ngx_http_slice_range_t;
+
+
 #define ngx_http_get_module_ctx(r, module)  (r)->ctx[module.ctx_index]
 #define ngx_http_set_ctx(r, c, module)      r->ctx[module.ctx_index] = c;
 
